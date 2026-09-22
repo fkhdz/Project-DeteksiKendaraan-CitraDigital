@@ -12,6 +12,7 @@ import easyocr
 import tkinter as tk
 from tkinter import filedialog
 from collections import Counter
+import glob
 
 # 1. KONFIGURASI PATH MODEL (LOKAL)
 plat_model_path = "plat_nomor_yolov8s_best.pt"
@@ -105,12 +106,129 @@ def cari_plat_terdekat(kendaraan_box, daftar_plat, img_h, img_w):
         
     return sorted(kandidat, key=lambda x: x[0])[0][1] if kandidat else None
 
-# 3. PIPELINE UTAMA DETEKSI
-def deteksi_gabungan_full(image_path, conf_jenis=0.30, conf_plat=0.20):
+# ==========================================
+# 3. PIPELINE UTAMA DETEKSI (VERSI BATCH)
+# ==========================================
+def deteksi_gabungan_full(image_path, folder_output, conf_jenis=0.30, conf_plat=0.20):
     img_bgr = cv2.imread(image_path)
     if img_bgr is None:
-        print("❌ Gambar gagal dibaca:", image_path)
-        return
+        print(f"❌ Gambar gagal dibaca: {image_path}")
+        return []
+    
+    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    img_vis = img_rgb.copy()
+    h, w = img_rgb.shape[:2]
+
+    # Prediksi Jenis & Plat
+    hasil_jenis = model_jenis.predict(source=image_path, conf=conf_jenis, verbose=False)
+    boxes_kendaraan = hasil_jenis[0].boxes
+    hasil_plat = detector_plat.predict(source=image_path, conf=conf_plat, imgsz=1280, verbose=False)
+    boxes_plat = hasil_plat[0].boxes
+
+    daftar_plat = []
+    for pbox in boxes_plat:
+        px1, py1, px2, py2 = map(int, pbox.xyxy[0])
+        px1, py1, px2, py2 = max(0, px1), max(0, py1), min(w, px2), min(h, py2)
+        pad_x, pad_y = int((px2 - px1) * 0.20), int((py2 - py1) * 0.35)
+        px1_pad, py1_pad = max(0, px1 - pad_x), max(0, py1 - pad_y)
+        px2_pad, py2_pad = min(w, px2 + pad_x), min(h, py2 + pad_y)
+        
+        crop_plat_bgr = img_bgr[py1_pad:py2_pad, px1_pad:px2_pad]
+        teks_plat, conf_ocr = baca_plat_dari_crop(crop_plat_bgr)
+        wilayah = deteksi_wilayah_plat(teks_plat)
+        daftar_plat.append({
+            "bbox": (px1, py1, px2, py2), "teks": teks_plat or "Tidak terbaca",
+            "wilayah": wilayah, "conf_deteksi": float(pbox.conf[0]), "conf_ocr": conf_ocr
+        })
+
+    hasil_data = []
+    if len(boxes_kendaraan) == 0:
+        print("⚠️ Tidak ada kendaraan terdeteksi")
+        return []
+
+    for i, box in enumerate(boxes_kendaraan, start=1):
+        x1, y1, x2, y2 = map(int, box.xyxy[0])
+        x1, y1, x2, y2 = max(0, x1), max(0, y1), min(w, x2), min(h, y2)
+        jenis = model_jenis.names[int(box.cls[0])]
+        
+        crop_kendaraan_rgb = img_rgb[y1:y2, x1:x2]
+        warna, conf_warna, top_warna = ("Tidak terdeteksi", 0.0, []) if crop_kendaraan_rgb.size == 0 else prediksi_warna_crop(crop_kendaraan_rgb, jenis=jenis)
+        
+        plat_terkait = cari_plat_terdekat((x1, y1, x2, y2), daftar_plat, h, w)
+        if not plat_terkait and len(boxes_kendaraan) == 1 and len(daftar_plat) == 1: 
+            plat_terkait = daftar_plat[0]
+        
+        nomor_plat = plat_terkait["teks"] if plat_terkait else "Tidak terdeteksi"
+        wilayah_plat = plat_terkait["wilayah"] if plat_terkait else "-"
+
+        # Drawing Bounding Boxes
+        cv2.rectangle(img_vis, (x1, y1), (x2, y2), (0, 255, 0), 3)
+        label = f"{jenis} | {warna}"
+        cv2.putText(img_vis, label, (x1 + 6, max(10, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 0, 0), 2)
+        
+        if plat_terkait:
+            px1, py1, px2, py2 = plat_terkait["bbox"]
+            cv2.rectangle(img_vis, (px1, py1), (px2, py2), (255, 255, 0), 2)
+            cv2.putText(img_vis, nomor_plat, (px1 + 5, max(10, py1 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
+
+        # Simpan nama file asli ke dalam tabel
+        nama_file = os.path.basename(image_path)
+        hasil_data.append({
+            "File": nama_file, "Kendaraan": i, "Jenis": jenis, 
+            "Warna": warna, "Nomor Plat": nomor_plat, "Wilayah": wilayah_plat[1]
+        })
+
+    # Simpan Gambar Hasil (Otomatis tanpa menahan script)
+    os.makedirs(folder_output, exist_ok=True)
+    path_simpan = os.path.join(folder_output, f"hasil_{os.path.basename(image_path)}")
+    img_bgr_out = cv2.cvtColor(img_vis, cv2.COLOR_RGB2BGR) # OpenCV butuh format BGR untuk menyimpan
+    cv2.imwrite(path_simpan, img_bgr_out)
+
+    return hasil_data
+
+# ==========================================
+# 4. EKSEKUSI DATASET (BATCH PROCESSING)
+# ==========================================
+if __name__ == "__main__":
+    # Tentukan nama folder berisi dataset gambar
+    folder_dataset = "dataset_kendaraan" 
+    folder_output = "hasil_deteksi_batch"
+
+    print(f"Mencari gambar di folder '{folder_dataset}'...")
+    
+    # Ambil semua gambar JPG dan PNG dari folder dataset
+    ekstensi = ('*.jpg', '*.jpeg', '*.png')
+    daftar_gambar = []
+    for eks in ekstensi:
+        daftar_gambar.extend(glob.glob(os.path.join(folder_dataset, eks)))
+
+    if not daftar_gambar:
+        print(f"❌ Tidak ada gambar ditemukan. Pastikan folder '{folder_dataset}' ada dan berisi gambar.")
+    else:
+        print(f"✅ Ditemukan {len(daftar_gambar)} gambar. Memulai proses batch...\n")
+        semua_hasil = []
+
+        for path_gambar in daftar_gambar:
+            print(f"Sedang memproses: {os.path.basename(path_gambar)}")
+            hasil = deteksi_gabungan_full(path_gambar, folder_output)
+            if hasil:
+                semua_hasil.extend(hasil)
+
+        # Ekspor gabungan data prediksi ke CSV agar mudah diolah seperti log
+        if semua_hasil:
+            df_total = pd.DataFrame(semua_hasil)
+            file_csv = os.path.join(folder_output, "rekap_prediksi.csv")
+            df_total.to_csv(file_csv, index=False)
+            print(f"\n🎉 Proses Selesai!")
+            print(f"Gambar beranotasi dan 'rekap_prediksi.csv' tersimpan di folder: {folder_output}/")
+
+# 3. PIPELINE UTAMA DETEKSI (VERSI BATCH)
+def deteksi_gabungan_full(image_path, folder_output, conf_jenis=0.30, conf_plat=0.20):
+    img_bgr = cv2.imread(image_path)
+    if img_bgr is None:
+        print(f"❌ Gambar gagal dibaca: {image_path}")
+        return []
+    
     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
     img_vis = img_rgb.copy()
     h, w = img_rgb.shape[:2]
@@ -138,9 +256,8 @@ def deteksi_gabungan_full(image_path, conf_jenis=0.30, conf_plat=0.20):
 
     hasil_data = []
     if len(boxes_kendaraan) == 0:
-        print("❌ Tidak ada kendaraan terdeteksi")
-        plt.imshow(img_rgb); plt.axis("off"); plt.title("Tidak ada kendaraan terdeteksi"); plt.show()
-        return
+        print("⚠️ Tidak ada kendaraan terdeteksi")
+        return []
 
     for i, box in enumerate(boxes_kendaraan, start=1):
         x1, y1, x2, y2 = map(int, box.xyxy[0])
@@ -151,7 +268,8 @@ def deteksi_gabungan_full(image_path, conf_jenis=0.30, conf_plat=0.20):
         warna, conf_warna, top_warna = ("Tidak terdeteksi", 0.0, []) if crop_kendaraan_rgb.size == 0 else prediksi_warna_crop(crop_kendaraan_rgb, jenis=jenis)
         
         plat_terkait = cari_plat_terdekat((x1, y1, x2, y2), daftar_plat, h, w)
-        if not plat_terkait and len(boxes_kendaraan) == 1 and len(daftar_plat) == 1: plat_terkait = daftar_plat[0]
+        if not plat_terkait and len(boxes_kendaraan) == 1 and len(daftar_plat) == 1: 
+            plat_terkait = daftar_plat[0]
         
         nomor_plat = plat_terkait["teks"] if plat_terkait else "Tidak terdeteksi"
         wilayah_plat = plat_terkait["wilayah"] if plat_terkait else "-"
@@ -165,29 +283,47 @@ def deteksi_gabungan_full(image_path, conf_jenis=0.30, conf_plat=0.20):
             cv2.rectangle(img_vis, (px1, py1), (px2, py2), (255, 255, 0), 2)
             cv2.putText(img_vis, nomor_plat, (px1 + 5, max(10, py1 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
 
-        hasil_data.append({"Kendaraan": i, "Jenis": jenis, "Warna": warna, "Nomor Plat": nomor_plat, "Wilayah": wilayah_plat[1]})
+        nama_file = os.path.basename(image_path)
+        hasil_data.append({
+            "File": nama_file, "Kendaraan": i, "Jenis": jenis, 
+            "Warna": warna, "Nomor Plat": nomor_plat, "Wilayah": wilayah_plat[1]
+        })
 
-    plt.figure(figsize=(12, 7))
-    plt.imshow(img_vis)
-    plt.axis("off")
-    plt.title("Hasil Deteksi Gabungan")
-    plt.show()
+    os.makedirs(folder_output, exist_ok=True)
+    path_simpan = os.path.join(folder_output, f"hasil_{os.path.basename(image_path)}")
+    img_bgr_out = cv2.cvtColor(img_vis, cv2.COLOR_RGB2BGR) 
+    cv2.imwrite(path_simpan, img_bgr_out)
 
-    df_hasil = pd.DataFrame(hasil_data)
-    print("\n📋 Tabel Hasil Deteksi Gabungan:")
-    print(df_hasil.to_string(index=False))
+    return hasil_data
 
-# 4. GUI SEDERHANA UNTUK PILIH GAMBAR
+
+# 4. EKSEKUSI DATASET (BATCH PROCESSING)
 if __name__ == "__main__":
-    root = tk.Tk()
-    root.withdraw() 
-    file_path = filedialog.askopenfilename(
-        title="Pilih Gambar Kendaraan",
-        filetypes=[("Image Files", "*.jpg;*.jpeg;*.png")]
-    )
+    folder_dataset = "dataset_kendaraan" 
+    folder_output = "hasil_deteksi_batch"
+
+    print(f"Mencari gambar di folder '{folder_dataset}'...")
     
-    if file_path:
-        print(f"\n🚗 Memproses gambar: {os.path.basename(file_path)}")
-        deteksi_gabungan_full(file_path)
+    ekstensi = ('*.jpg', '*.jpeg', '*.png')
+    daftar_gambar = []
+    for eks in ekstensi:
+        daftar_gambar.extend(glob.glob(os.path.join(folder_dataset, eks)))
+
+    if not daftar_gambar:
+        print(f"❌ Tidak ada gambar ditemukan. Pastikan folder '{folder_dataset}' ada dan berisi gambar.")
     else:
-        print("❌ Pemilihan gambar dibatalkan.")
+        print(f"✅ Ditemukan {len(daftar_gambar)} gambar. Memulai proses batch...\n")
+        semua_hasil = []
+
+        for path_gambar in daftar_gambar:
+            print(f"Sedang memproses: {os.path.basename(path_gambar)}")
+            hasil = deteksi_gabungan_full(path_gambar, folder_output)
+            if hasil:
+                semua_hasil.extend(hasil)
+                
+        if semua_hasil:
+            df_total = pd.DataFrame(semua_hasil)
+            file_csv = os.path.join(folder_output, "rekap_prediksi.csv")
+            df_total.to_csv(file_csv, index=False)
+            print(f"\n🎉 Proses Selesai!")
+            print(f"Gambar beranotasi dan 'rekap_prediksi.csv' tersimpan di folder: {folder_output}/")

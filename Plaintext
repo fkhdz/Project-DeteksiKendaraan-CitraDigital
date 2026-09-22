@@ -1,7 +1,10 @@
-Project_Kendaraan/
+Project-DeteksiKendaraan/
 │
-├── deteksi_lokal.py                 
-├── plat_nomor_yolov8s_best.pt       # Model YOLO Plat
-├── jenis_kendaraan_yolo_best.pt     # Model YOLO Jenis Kendaraan
-├── warna_kendaraan_resnet50.keras   # Model ResNet50 Warna
-└── warna_kendaraan_classes.json     # File JSON class warna
+├── deteksi_lokal.py                 # Script utama untuk GUI / inferensi single image
+├── deteksi_batch.py                 # Script untuk inferensi banyak gambar sekaligus
+├── plat_nomor_yolov8s_best.pt       # Model YOLO Plat (Download terpisah)
+├── jenis_kendaraan_yolo_best.pt     # Model YOLO Jenis Kendaraan (Download terpisah)
+├── warna_kendaraan_resnet50.keras   # Model ResNet50 Warna (Download terpisah)
+├── warna_kendaraan_classes.json     # File mapping class warna
+├── dataset_kendaraan/               # Folder untuk menaruh gambar uji coba
+└── README.md
