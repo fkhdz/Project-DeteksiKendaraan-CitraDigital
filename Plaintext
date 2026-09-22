@@ -1,0 +1,7 @@
+Project_Kendaraan/
+│
+├── deteksi_lokal.py                 
+├── plat_nomor_yolov8s_best.pt       # Model YOLO Plat
+├── jenis_kendaraan_yolo_best.pt     # Model YOLO Jenis Kendaraan
+├── warna_kendaraan_resnet50.keras   # Model ResNet50 Warna
+└── warna_kendaraan_classes.json     # File JSON class warna
